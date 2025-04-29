@@ -38,7 +38,6 @@ fn message_receiver(mut connection: TcpStream) {
 }
 fn parse_command(connection: &mut TcpStream, logged_in: &mut bool) -> i32 {
     let mut command = String::new();
-    print!(">");
     io::stdin().read_line(&mut command)
         .expect("If read_line() fails god help you");
     let mut words = command.split_whitespace();

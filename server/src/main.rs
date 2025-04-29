@@ -1,33 +1,37 @@
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::sync::{Mutex, Arc, MutexGuard};
+use std::sync::{Mutex, Arc};
 use std::collections::HashMap;
-use std::io::{stdout, Read, Write};
-use std::ptr::write;
+use std::io::{Read, Write};
 use std::collections::VecDeque;
 type UsersCollection = Arc<Mutex<HashMap<String, User>>>;
-struct Message {
-    from_whom: String,
-    msg: String,
-}
 struct User {
     msg_queue: VecDeque<String>,
+    socket: TcpStream,
     is_online: bool,
 }
 
 fn main() -> std::io::Result<()>{
     let listener = TcpListener::bind("127.0.0.1:2137")?;
 
-    let users : UsersCollection = Arc::new(Mutex::new(HashMap::new()));
+    let mut users : UsersCollection = Arc::new(Mutex::new(HashMap::new()));
     let mut connections = Vec::new();
     println!("Server running");
     for stream in listener.incoming() {
         println!("A new client connected!");
         match stream {
-            Ok(socket) => {
+            Ok(mut socket) => {
+                let mut buffer: [u8;1024] = [0; 1024];
+                let login = msg_get_login(&mut buffer, &mut socket);
+                if login.eq("error") {
+                    eprintln!("Did not receive the login from the user");
+                    continue
+                }
+                println!("Received login: \"{login}\"");
+                user_add_if_not_exists(&mut users, login.clone(), socket.try_clone()?);
                 let users = users.clone();
                 let handle = thread::spawn(move || {
-                   handle_connection(socket, users);
+                   handle_connection(socket, users, login);
                 });
                 connections.push(handle);
             }
@@ -40,15 +44,8 @@ fn main() -> std::io::Result<()>{
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, mut users: UsersCollection) {
+fn handle_connection(mut stream: TcpStream, mut users: UsersCollection, mut login: String) {
     let mut buffer: [u8;1024] = [0; 1024];
-    let mut login = msg_get_login(&mut buffer, &mut stream);
-    if login.eq("error") {
-        eprintln!("Did not receive the login from the user");
-        return
-    }
-    println!("Recieved login: \"{login}\"");
-    user_add_if_not_exists(&mut users, login.clone());
     if user_has_pending_messages(&mut users, &login) {
         user_send_pending_messages(&mut users, &login, &mut stream);
     }
@@ -68,7 +65,8 @@ fn handle_connection(mut stream: TcpStream, mut users: UsersCollection) {
         let mut words = msg.split_whitespace();
         let target = words.next().unwrap().trim();
         println!("Detected target: \"{target}\"");
-        let target_login = String::from(target);
+        let mut target_login = String::new();
+        target_login += target;
         if !user_exists(&target_login, &users) {
             println!("Target \"{target_login}\" does not exist");
             writeln!(stream, "User {target_login} does not exist").unwrap_or_else(|err| {
@@ -78,7 +76,7 @@ fn handle_connection(mut stream: TcpStream, mut users: UsersCollection) {
         }
         let msg_without_target = &msg[target.len()..];
         println!("Msg without target: {msg_without_target}");
-        send_msg(&mut login, target_login, &mut users, &mut stream, String::from(msg_without_target));
+        send_msg(&mut login, target_login, &mut users, String::from(msg_without_target));
     }
     println!("Ending communication with client");
     user_update_online(&mut users, &login, false);
@@ -90,7 +88,7 @@ fn msg_get_login(buffer: &mut [u8], stream: &mut TcpStream) -> String {
         0
     });
     if received_bytes <= 0 {return String::from("error")}
-    let msg = String::from_utf8(buffer.to_vec()).unwrap_or_else(|err| {
+    let msg = String::from_utf8(buffer[..received_bytes].to_vec()).unwrap_or_else(|err| {
         eprintln!("Error converting to str: {err}");
         String::from("error")
     });
@@ -102,19 +100,20 @@ fn user_exists(login: &String, users: &UsersCollection) -> bool {
     data.contains_key(login)
 }
 
-fn user_add(users: &mut UsersCollection, login: String) -> i32 {
+fn user_add(users: &mut UsersCollection, login: String, socket: TcpStream) -> i32 {
     let mut data = users.lock().unwrap();
-    let user = User {msg_queue: VecDeque::new(), is_online: true};
+    let user = User {msg_queue: VecDeque::new(), is_online: true, socket };
     data.insert(login, user);
     0
 }
-fn user_add_if_not_exists(users: &mut UsersCollection, login: String) -> i32{
+fn user_add_if_not_exists(users: &mut UsersCollection, login: String, socket: TcpStream) -> i32{
     if !user_exists(&login, users) {
         println!("Added user with login \"{login}\"");
-        user_add(users, login);
+        user_add(users, login, socket);
         return 0
     }
     user_update_online(users, &login, true);
+    user_update_connection(users, &login, socket);
     0
 }
 
@@ -122,6 +121,13 @@ fn user_update_online(users: &mut UsersCollection, login: &String, value: bool) 
     let mut data = users.lock().unwrap();
     let user = data.get_mut(login).unwrap();
     user.is_online = value;
+    0
+}
+
+fn user_update_connection(users: &mut UsersCollection, login: &String, socket: TcpStream) -> i32 {
+    let mut data = users.lock().unwrap();
+    let user = data.get_mut(login).unwrap();
+    user.socket = socket;
     0
 }
 
@@ -138,22 +144,23 @@ fn user_has_pending_messages(users: &mut UsersCollection, login: &String) -> boo
 
 fn user_send_pending_messages(users: &mut UsersCollection, login: &String, stream: &mut TcpStream) {
     let mut data = users.lock().unwrap();
-    let mut user = data.get_mut(login).unwrap();
-    let mut queue = &user.msg_queue;
+    let user = data.get_mut(login).unwrap();
+    let queue = &mut user.msg_queue;
     while !queue.is_empty() {
-        let message = queue.front().unwrap();
+        let message = queue.pop_front().unwrap();
         write!(stream, "{message}").unwrap_or_else(|err| {
             eprintln!("Error in sending pending messages: {err}");
         });
     }
 }
-fn send_msg(from: &mut String, to: String, users: &mut UsersCollection, stream: &mut TcpStream, msg: String) {
+fn send_msg(from: &mut String, to: String, users: &mut UsersCollection, msg: String) {
     let msg = format!("[{}]: {}", from.clone(), msg);
     let mut data = users.lock().unwrap();
     let receiver = data.get_mut(&to).unwrap();
     println!("{msg}");
     if receiver.is_online {
-        write!(stream, "{msg}").unwrap_or_else(|err| {
+        let connection = &mut receiver.socket;
+        write!(connection, "{msg}").unwrap_or_else(|err| {
             eprintln!("send_msg(): {err}");
         });
     } else {
